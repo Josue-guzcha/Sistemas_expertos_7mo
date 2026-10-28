@@ -1,0 +1,11 @@
+{
+ "version": 1,
+ "reglas": [
+  "si llueve entonces me mojo",
+  "si me mojo entonces me enfermo",
+  "no estoy enfermo"
+ ],
+ "seccion": "reglas",
+ "arbol": null,
+ "resultado": null
+}

@@ -6,8 +6,11 @@ Ejecutar:  python gui_retro.py
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 
@@ -15,6 +18,9 @@ try:
     import motor_inferencia as m
 except ModuleNotFoundError:  # por si guardaste el motor con otro nombre
     import proposiciones_gui as m
+
+# Archivo donde se guarda la sesión (junto a este programa)
+ARCHIVO = Path(__file__).resolve().parent / "estado_motor.json"
 
 # ---------------------------------------------------------------------------
 # Colores (estilo terminal ámbar)
@@ -52,7 +58,9 @@ ESTILOS = {
     "derivada": ("#160d00", "#a86a00", "#e0a030"),
     "cerrada": ("#2e0e00", "#ff5a36", "#ff7a5a"),
     "abierta": ("#142200", "#9be34a", "#9be34a"),
+    "modelo": ("#0f1a00", "#9be34a", "#c9f58a"),
 }
+GAP_Y = ALTO_NIVEL - ALTO_CAJA
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +75,30 @@ class Caja:
         self.ancho_subarbol = 0.0
         self.cx = 0.0
         self.y = 0.0
+        self.alto = float(ALTO_CAJA)
 
 
-def a_cajas(nodo) -> Caja:
+def caja_a_dict(c: Caja) -> dict:
+    return {"t": c.texto, "e": c.estilo, "h": [caja_a_dict(h) for h in c.hijos]}
+
+
+def dict_a_caja(d: dict) -> Caja:
+    c = Caja(d["t"], d["e"])
+    c.hijos = [dict_a_caja(h) for h in d["h"]]
+    return c
+
+
+def texto_modelo(valores: dict) -> str:
+    """Modelo de una rama abierta: valores de verdad con los que se cumplen todas las reglas."""
+    partes = [f"{x} = {'V' if valores[x] else 'F'}" for x in m.atomos if x in valores]
+    libres = [x for x in m.atomos if x not in valores]
+    lineas = [", ".join(partes[i:i + 4]) for i in range(0, len(partes), 4)]
+    if libres:
+        lineas.append(f"(libres: {', '.join(libres)})")
+    return "MODELO\n" + "\n".join(lineas)
+
+
+def a_cajas(nodo, modelos: dict) -> Caja:
     texto = m.formula_a_texto(nodo.formula)
     if nodo.etiqueta:
         texto = f"{nodo.etiqueta}: {texto}"
@@ -77,16 +106,20 @@ def a_cajas(nodo) -> Caja:
         texto += f"  ✓{nodo.aplicado}"
     caja = Caja(texto, "original" if nodo.etiqueta else "derivada")
     if nodo.hijos:
-        caja.hijos = [a_cajas(h) for h in nodo.hijos]
+        caja.hijos = [a_cajas(h, modelos) for h in nodo.hijos]
     elif nodo.estado == "cerrada":
         caja.hijos = [Caja(f"✕ CERRADA ({nodo.motivo})", "cerrada")]
     else:
-        caja.hijos = [Caja(f"○ ABIERTA #{nodo.numero}", "abierta")]
+        abierta = Caja(f"○ ABIERTA #{nodo.numero}", "abierta")
+        abierta.hijos = [Caja(texto_modelo(modelos.get(nodo.numero, {})), "modelo")]
+        caja.hijos = [abierta]
     return caja
 
 
 def medir(caja: Caja, ancho_texto) -> float:
-    caja.ancho_caja = ancho_texto(caja.texto) + 2 * PAD_X
+    lineas = caja.texto.split("\n")
+    caja.alto = max(ALTO_CAJA, 18 * len(lineas) + 12)
+    caja.ancho_caja = max(ancho_texto(l) for l in lineas) + 2 * PAD_X
     total = sum(medir(h, ancho_texto) for h in caja.hijos) + SEP_X * max(len(caja.hijos) - 1, 0)
     caja.ancho_subarbol = max(caja.ancho_caja, total)
     return caja.ancho_subarbol
@@ -99,7 +132,7 @@ def posicionar(caja: Caja, cx: float, y: float) -> None:
     total = sum(h.ancho_subarbol for h in caja.hijos) + SEP_X * (len(caja.hijos) - 1)
     x = cx - total / 2
     for h in caja.hijos:
-        posicionar(h, x + h.ancho_subarbol / 2, y + ALTO_NIVEL)
+        posicionar(h, x + h.ancho_subarbol / 2, y + caja.alto + GAP_Y)
         x += h.ancho_subarbol + SEP_X
 
 
@@ -156,6 +189,9 @@ class App(tk.Tk):
         self.f_arbol = tkfont.Font(family="Consolas", size=10)
 
         self.detalle_ultimo = ""
+        self.arbol_cajas = None
+        self.resultado_trozos: list = []
+        self._pendiente_centrar = False
         self.paginas: dict[str, tk.Frame] = {}
         self.items: dict[str, ItemNav] = {}
         self.actual = SECCIONES[0][0]
@@ -166,9 +202,12 @@ class App(tk.Tk):
         self._crear_barra_inferior()
         self._atajos()
 
+        self._limpiar_resultados()
+        seccion = self.cargar_estado()
         self.refrescar()
-        self.mostrar("agregar")
-        self.estado("Escribe una regla o un hecho en español y presiona Enter.", "info")
+        self.mostrar(seccion)
+        self.estado(*self._msg_inicial)
+        self.protocol("WM_DELETE_WINDOW", self._cerrar)
 
     # ----------------------------------------------------------- construcción
     def _estilos(self) -> None:
@@ -219,8 +258,12 @@ class App(tk.Tk):
         self.pila.grid_columnconfigure(0, weight=1)
 
         self._pagina_agregar()
-        self._pagina_tabla("reglas", [("id", "ID", 60), ("tipo", "Tipo", 80), ("conector", "Conector", 130),
-                                      ("formula", "Fórmula", 260), ("texto", "Texto original", 520)])
+        self._pagina_tabla("reglas", [("id", "ID", 60), ("tipo", "Tipo", 80), ("conector", "Conector", 120),
+                                      ("formula", "Fórmula", 240), ("texto", "Texto original", 420),
+                                      ("accion", "Acción", 150)],
+                           pie="Selecciona una regla: aparece su botón «Borrar» en la columna Acción "
+                               "(también funciona la tecla Supr).")
+        self._preparar_borrado()
         self._pagina_tabla("atomos", [("letra", "Letra", 80), ("significado", "Significado", 520),
                                       ("donde", "Aparece en", 380)])
         self._pagina_tableau()
@@ -284,23 +327,30 @@ class App(tk.Tk):
         self.lbl_detalle.pack(fill="x", padx=14, pady=(0, 12))
 
     # ---- páginas con tabla
-    def _pagina_tabla(self, clave: str, columnas) -> None:
+    def _pagina_tabla(self, clave: str, columnas, pie: str | None = None) -> None:
         f = self._nueva_pagina(clave)
+        if pie:
+            tk.Label(f, text=pie, bg=BG, fg=TENUE, font=self.f_chico, anchor="w").pack(
+                side="bottom", fill="x", pady=(6, 0))
         t = ttk.Treeview(f, columns=[c[0] for c in columnas], show="headings", style="Retro.Treeview")
         for k, titulo, ancho in columnas:
             t.heading(k, text=titulo)
             t.column(k, width=ancho, anchor="w")
         sb = ttk.Scrollbar(f, command=t.yview)
-        t.configure(yscrollcommand=sb.set)
+        t.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self._tras_scroll(clave)))
         sb.pack(side="right", fill="y")
         t.pack(fill="both", expand=True)
         setattr(self, f"tabla_{clave}", t)
 
+    def _tras_scroll(self, clave: str) -> None:
+        if clave == "reglas" and hasattr(self, "btn_borrar"):
+            self.after_idle(self._posicionar_boton)
+
     # ---- página: tableau
     def _pagina_tableau(self) -> None:
         f = self._nueva_pagina("tableau")
-        tk.Label(f, text="Arrastra con el mouse para moverte.  ✓n = paso en que se desarrolló la fórmula  |  "
-                         "✕ rama cerrada  |  ○ rama abierta", bg=BG, fg=TENUE, font=self.f_chico,
+        tk.Label(f, text="Arrastra para moverte | ✓n paso en que se desarrolló | ✕ rama cerrada | "
+                         "○ rama abierta + MODELO", bg=BG, fg=TENUE, font=self.f_chico,
                  anchor="w").pack(side="bottom", fill="x", pady=(4, 0))
         marco = tk.Frame(f, bg=BG, highlightthickness=1, highlightbackground=BORDE)
         marco.pack(fill="both", expand=True)
@@ -358,6 +408,8 @@ class App(tk.Tk):
         self.lbl_titulo.configure(text=dict(SECCIONES)[clave].upper())
         if clave == "agregar":
             self.entrada.focus_set()
+        if clave == "tableau" and self._pendiente_centrar:
+            self.after(80, self._centrar_vista)
 
     def estado(self, mensaje: str, tipo: str = "info") -> None:
         colores = {"info": TENUE, "ok": VERDE, "aviso": AMBAR, "error": ROJO}
@@ -393,24 +445,183 @@ class App(tk.Tk):
         if iguales:
             mensaje += f"   ¡idéntica a {', '.join(iguales)}!"
         self.estado(mensaje, "aviso" if iguales else "ok")
+        self.guardar()
         return True
 
     def eliminar_ultima(self) -> None:
         if not m.reglas:
             self.estado("No hay reglas que eliminar.", "error")
             return
-        id_regla, datos = m.reglas.popitem()  # la última que se agregó
-        usados: set[str] = set()
-        for d in m.reglas.values():
-            usados |= m.atomos_de(d["formula"])
-        for letra in [l for l in m.atomos if l not in usados]:
-            del m.atomos[letra]
-        for clave in [k for k, l in m.indice_atomos.items() if l not in m.atomos]:
-            del m.indice_atomos[clave]
+        self.borrar_regla(list(m.reglas)[-1], confirmar=False)
+
+    # ---- borrar cualquier regla (botón sobre la fila seleccionada)
+    def _preparar_borrado(self) -> None:
+        t = self.tabla_reglas
+        self.btn_borrar = tk.Button(t, text="✕ Borrar", command=self.borrar_seleccionada, bg=BG2, fg=ROJO,
+                                    font=self.f_bold, activebackground=ROJO, activeforeground="#000000",
+                                    relief="flat", bd=0, highlightthickness=1, highlightbackground=ROJO,
+                                    cursor="hand2")
+        t.bind("<<TreeviewSelect>>", lambda _e: self._posicionar_boton())
+        for col in t["columns"]:
+            t.column(col, stretch=False)
+        t.bind("<Configure>", lambda _e: (self._ajustar_columnas(), self.after_idle(self._posicionar_boton)))
+        t.bind("<MouseWheel>", lambda _e: self.after_idle(self._posicionar_boton))
+        t.bind("<Delete>", lambda _e: self.borrar_seleccionada())
+
+    def _ajustar_columnas(self) -> None:
+        """La columna 'Texto original' ocupa el espacio sobrante para que 'Acción' siempre quede visible."""
+        t = self.tabla_reglas
+        fijos = sum(int(t.column(c, "width")) for c in t["columns"] if c != "texto")
+        t.column("texto", width=max(160, t.winfo_width() - fijos - 4))
+
+    def _posicionar_boton(self) -> None:
+        if not hasattr(self, "btn_borrar"):
+            return
+        t = self.tabla_reglas
+        sel = t.selection()
+        celda = t.bbox(sel[0], "accion") if sel else ""
+        if not celda:
+            self.btn_borrar.place_forget()
+            return
+        x, y, w, h = celda
+        self.btn_borrar.configure(text=f"✕ Borrar {t.set(sel[0], 'id')}")
+        self.btn_borrar.place(x=x + 4, y=y + 2, width=w - 8, height=h - 4)
+
+    def borrar_seleccionada(self) -> None:
+        sel = self.tabla_reglas.selection()
+        if not sel:
+            self.estado("Selecciona primero una regla en la tabla.", "error")
+            return
+        self.borrar_regla(self.tabla_reglas.set(sel[0], "id"))
+
+    def _confirmar_borrado(self, id_regla: str, datos: dict) -> bool:
+        dlg = tk.Toplevel(self)
+        dlg.title("Confirmar borrado")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        marco = tk.Frame(dlg, bg=BG, highlightthickness=1, highlightbackground=BORDE)
+        marco.pack(padx=14, pady=14)
+        tk.Label(marco, text="¿Borrar esta regla?", bg=BG, fg=AMBAR, font=self.f_titulo,
+                 anchor="w").pack(fill="x", padx=18, pady=(14, 8))
+        tk.Label(marco, text=f"{id_regla}: {datos['formula_texto']}", bg=BG, fg=AMBAR, font=self.f_bold,
+                 anchor="w", justify="left", wraplength=520).pack(fill="x", padx=18)
+        tk.Label(marco, text=f"«{datos['original']}»", bg=BG, fg=TENUE, font=self.f_mono, anchor="w",
+                 justify="left", wraplength=520).pack(fill="x", padx=18, pady=(2, 12))
+        fila = tk.Frame(marco, bg=BG)
+        fila.pack(fill="x", padx=18, pady=(0, 16))
+        decision = {"ok": False}
+
+        def cerrar(ok: bool) -> None:
+            decision["ok"] = ok
+            dlg.destroy()
+
+        btn_no = tk.Button(fila, text="Cancelar", command=lambda: cerrar(False), bg=BG2, fg=AMBAR,
+                           font=self.f_mono, activebackground=AMBAR, activeforeground="#000000",
+                           relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDE,
+                           padx=14, pady=5, cursor="hand2")
+        btn_si = tk.Button(fila, text=f"Borrar {id_regla}", command=lambda: cerrar(True), bg=BG2, fg=ROJO,
+                           font=self.f_bold, activebackground=ROJO, activeforeground="#000000",
+                           relief="flat", bd=0, highlightthickness=1, highlightbackground=ROJO,
+                           padx=14, pady=5, cursor="hand2")
+        btn_si.pack(side="left", padx=(0, 10))
+        btn_no.pack(side="left")
+        dlg.bind("<Escape>", lambda _e: cerrar(False))
+        dlg.bind("<Return>", lambda e: e.widget.invoke() if isinstance(e.widget, tk.Button) else None)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: cerrar(False))
+        btn_no.focus_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window(dlg)
+        return decision["ok"]
+
+    def borrar_regla(self, id_regla: str, confirmar: bool = True) -> None:
+        datos = m.reglas.get(id_regla)
+        if datos is None:
+            return
+        if confirmar and not self._confirmar_borrado(id_regla, datos):
+            self.estado("Borrado cancelado.", "info")
+            return
+        era_ultima = id_regla == list(m.reglas)[-1]
+        textos = [d["original"] for i, d in m.reglas.items() if i != id_regla]
+        # Se reconstruye la base: IDs (R1, R2...) y letras (p, q, r...) quedan consecutivos
+        m.reglas.clear()
+        m.atomos.clear()
+        m.indice_atomos.clear()
+        for texto in textos:
+            formula, _ = m.interpretar_oracion(texto)
+            m.almacenar_regla(m.generar_id(), texto, formula)
         self.detalle_ultimo = ""
         self._limpiar_resultados()
         self.refrescar()
-        self.estado(f"Se eliminó {id_regla}: {datos['formula_texto']}   («{datos['original']}»)", "aviso")
+        mensaje = f"Se eliminó {id_regla}: {datos['formula_texto']}   («{datos['original']}»)"
+        if not era_ultima:
+            mensaje += "   Las reglas y los átomos restantes se renumeraron en orden."
+        self.estado(mensaje, "aviso")
+        self.guardar()
+
+    # ---- guardado automático de la sesión
+    def guardar(self) -> None:
+        hay_arbol = self.arbol_cajas is not None
+        datos = {
+            "version": 1,
+            "reglas": [d["original"] for d in m.reglas.values()],
+            "seccion": self.actual,
+            "arbol": caja_a_dict(self.arbol_cajas) if hay_arbol else None,
+            "resultado": [list(t) for t in self.resultado_trozos] if hay_arbol else None,
+        }
+        try:
+            tmp = ARCHIVO.with_suffix(".tmp")
+            tmp.write_text(json.dumps(datos, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, ARCHIVO)
+        except OSError as error:
+            self.estado(f"No se pudo guardar la sesión: {error}", "error")
+
+    def cargar_estado(self) -> str:
+        """Restaura reglas, árbol, modelos y resultado de la última sesión. Devuelve la sección a mostrar."""
+        self._msg_inicial = ("Escribe una regla o un hecho en español y presiona Enter.", "info")
+        if not ARCHIVO.exists():
+            return "agregar"
+        try:
+            datos = json.loads(ARCHIVO.read_text(encoding="utf-8"))
+            for texto in datos.get("reglas", []):
+                try:
+                    formula, _ = m.interpretar_oracion(texto)
+                except ValueError:
+                    continue
+                m.almacenar_regla(m.generar_id(), texto, formula)
+            restaurado = False
+            if datos.get("arbol") is not None:
+                self._pintar(dict_a_caja(datos["arbol"]))
+                if datos.get("resultado"):
+                    self._escribir([tuple(t) for t in datos["resultado"]])
+                restaurado = True
+            seccion = datos.get("seccion", "agregar")
+            if seccion not in dict(SECCIONES):
+                seccion = "agregar"
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            m.reglas.clear()
+            m.atomos.clear()
+            m.indice_atomos.clear()
+            self._limpiar_resultados()
+            self._msg_inicial = (f"No se pudo leer la sesión guardada ({error}). Se inicia en blanco.", "error")
+            return "agregar"
+        if m.reglas:
+            extra = " y su tableau" if restaurado else ""
+            self._msg_inicial = (f"Sesión anterior restaurada: {len(m.reglas)} regla(s){extra}. "
+                                 "Puedes seguir agregando reglas.", "ok")
+        return seccion
+
+    def _cerrar(self) -> None:
+        self.guardar()
+        self.destroy()
 
     def cargar_ejemplo(self) -> None:
         for frase in EJEMPLO:
@@ -425,9 +636,11 @@ class App(tk.Tk):
         self._limpiar_resultados()
         self.refrescar()
         self.estado("Se borraron todas las reglas, los átomos y el tableau.", "info")
+        self.guardar()
 
     def _limpiar_resultados(self) -> None:
         self.canvas.delete("all")
+        self.arbol_cajas = None
         self._escribir([("Aún no hay resultados. Presiona Ctrl+R para resolver.\n", "tenue")])
 
     def refrescar(self) -> None:
@@ -435,7 +648,7 @@ class App(tk.Tk):
             tabla.delete(*tabla.get_children())
         for id_regla, d in m.reglas.items():
             self.tabla_reglas.insert("", "end", values=(
-                id_regla, d["tipo"], d["conector"], d["formula_texto"], d["original"]))
+                id_regla, d["tipo"], d["conector"], d["formula_texto"], d["original"], ""))
         for letra, significado in m.atomos.items():
             donde = [i for i, d in m.reglas.items() if letra in m.atomos_de(d["formula"])]
             self.tabla_atomos.insert("", "end", values=(letra, f'"{significado}"', ", ".join(donde)))
@@ -449,6 +662,7 @@ class App(tk.Tk):
             self.lbl_ultima.configure(text="(todavía no hay reglas)")
             self.lbl_ultima_texto.configure(text="")
         self.lbl_detalle.configure(text=self.detalle_ultimo)
+        self.after_idle(self._posicionar_boton)
 
     def resolver(self) -> None:
         if not m.reglas:
@@ -460,16 +674,21 @@ class App(tk.Tk):
         except RuntimeError as error:
             self.estado(f"{error}.", "error")
             return
-        self.dibujar(res["raiz"])
+        self.dibujar(res["raiz"], res["abiertas"])
         self.mostrar_resultado(res)
+        self.guardar()
         self.mostrar("tableau")
         self.estado(f"Tableau listo: {len(res['abiertas'])} rama(s) abierta(s), "
                     f"{res['n_cerradas']} cerrada(s). Detalle en la sección Resultado.", "ok")
 
     # ------------------------------------------------------------------ dibujo
-    def dibujar(self, raiz) -> None:
+    def dibujar(self, raiz, abiertas) -> None:
+        modelos = {a["numero"]: a["valores"] for a in abiertas}
+        self._pintar(a_cajas(raiz, modelos))
+
+    def _pintar(self, arbol: Caja) -> None:
+        self.arbol_cajas = arbol
         self.canvas.delete("all")
-        arbol = a_cajas(raiz)
         medir(arbol, self.f_arbol.measure)
         margen = 30
         posicionar(arbol, margen + arbol.ancho_subarbol / 2, margen)
@@ -478,27 +697,39 @@ class App(tk.Tk):
         while pila:
             c = pila.pop()
             for h in c.hijos:
-                self.canvas.create_line(c.cx, c.y + ALTO_CAJA, h.cx, h.y, fill="#7a5200", width=1.5)
+                self.canvas.create_line(c.cx, c.y + c.alto, h.cx, h.y, fill="#7a5200", width=1.5)
             pila.extend(c.hijos)
         pila = [arbol]
         while pila:
             c = pila.pop()
             relleno, borde, texto = ESTILOS[c.estilo]
             x1, x2 = c.cx - c.ancho_caja / 2, c.cx + c.ancho_caja / 2
-            self.canvas.create_rectangle(x1, c.y, x2, c.y + ALTO_CAJA, fill=relleno, outline=borde, width=1.5)
-            self.canvas.create_text(c.cx, c.y + ALTO_CAJA / 2, text=c.texto, fill=texto, font=self.f_arbol)
+            self.canvas.create_rectangle(x1, c.y, x2, c.y + c.alto, fill=relleno, outline=borde, width=1.5)
+            self.canvas.create_text(c.cx, c.y + c.alto / 2, text=c.texto, fill=texto, font=self.f_arbol,
+                                    justify="center")
             pila.extend(c.hijos)
 
         x0, y0, x1, y1 = self.canvas.bbox("all")
         self.canvas.configure(scrollregion=(x0 - margen, y0 - margen, x1 + margen, y1 + margen))
+        self._geom = (x0 - margen, (x1 - x0) + 2 * margen, arbol.cx)
+        self._centrar_vista()
+
+    def _centrar_vista(self) -> None:
+        if self.arbol_cajas is None or not hasattr(self, "_geom"):
+            return
         self.update_idletasks()
-        total = (x1 - x0) + 2 * margen
-        ancho_vista = max(self.canvas.winfo_width(), 1)
-        self.canvas.xview_moveto(max(0.0, min(1.0, (arbol.cx - ancho_vista / 2 - (x0 - margen)) / total)))
+        ancho_vista = self.canvas.winfo_width()
+        if ancho_vista <= 1:  # la ventana aún no se dibuja: se centra al mostrar la sección
+            self._pendiente_centrar = True
+            return
+        self._pendiente_centrar = False
+        x_ini, total, cx = self._geom
+        self.canvas.xview_moveto(max(0.0, min(1.0, (cx - ancho_vista / 2 - x_ini) / total)))
         self.canvas.yview_moveto(0)
 
     # --------------------------------------------------------------- resultado
     def _escribir(self, trozos: list[tuple[str, str]]) -> None:
+        self.resultado_trozos = trozos
         self.texto.configure(state="normal")
         self.texto.delete("1.0", tk.END)
         for contenido, etiqueta in trozos:
